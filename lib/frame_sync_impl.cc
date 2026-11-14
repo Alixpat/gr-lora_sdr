@@ -84,6 +84,7 @@ namespace gr
             cx_in = new kiss_fft_cpx[m_number_of_bins];
             cx_out = new kiss_fft_cpx[m_number_of_bins];
             init_detection();
+            init_channel_filter();
             // register message ports
             message_port_register_in(pmt::mp("frame_info"));
             set_msg_handler(pmt::mp("frame_info"), [this](pmt::pmt_t msg)
@@ -118,7 +119,8 @@ namespace gr
         }
         void frame_sync_impl::forecast(int noutput_items, gr_vector_int &ninput_items_required)
         {
-            ninput_items_required[0] = (m_os_factor * (m_number_of_bins + 2));
+            // the channel filter needs half of its length after the last sample read
+            ninput_items_required[0] = (m_os_factor * (m_number_of_bins + 2)) + m_filt_taps.size() / 2;
         }
 
         float frame_sync_impl::estimate_CFO_frac(gr_complex *samples)
@@ -339,6 +341,38 @@ namespace gr
                 fft_mag_sq[i] = cx_out[i].r * cx_out[i].r + cx_out[i].i * cx_out[i].i;
         }
 
+        void frame_sync_impl::init_channel_filter()
+        {
+            m_filt_taps.clear();
+            if (m_os_factor > 1)
+            {
+                // Root raised cosine filter with a symbol rate equal to the LoRa bandwidth. Its bandwidth at
+                // -3 dB is the LoRa bandwidth and it leaves the noise uncorrelated after the downsampling, as
+                // assumed by the preamble detection threshold.
+                const double alpha = 0.35; // roll-off factor
+                int n_taps = 16 * m_os_factor + 1;
+                double tap_sum = 0;
+                m_filt_taps.resize(n_taps);
+                for (int n = 0; n < n_taps; n++)
+                {
+                    double x = (n - (n_taps - 1) / 2.0) / m_os_factor; // time relative to 1/bandwidth
+                    double tap;
+                    if (x == 0)
+                        tap = 1 + alpha * (4 / M_PI - 1);
+                    else if (fabs(fabs(4 * alpha * x) - 1) < 1e-9)
+                        tap = alpha / sqrt(2) * ((1 + 2 / M_PI) * sin(M_PI / (4 * alpha)) + (1 - 2 / M_PI) * cos(M_PI / (4 * alpha)));
+                    else
+                        tap = (sin(M_PI * x * (1 - alpha)) + 4 * alpha * x * cos(M_PI * x * (1 + alpha))) / (M_PI * x * (1 - pow(4 * alpha * x, 2)));
+                    m_filt_taps[n] = tap;
+                    tap_sum += tap;
+                }
+                for (int n = 0; n < n_taps; n++)
+                    m_filt_taps[n] /= tap_sum;
+                m_filt_in.assign(n_taps + 2 * m_samples_per_symbol + 2 * m_os_factor, gr_complex(0, 0));
+                m_filt_out.assign(2 * m_samples_per_symbol + 2 * m_os_factor, gr_complex(0, 0));
+            }
+        }
+
         void frame_sync_impl::init_detection()
         {
             m_det_cnt = 0;
@@ -485,6 +519,7 @@ namespace gr
             cx_out = new kiss_fft_cpx[m_number_of_bins];
             set_output_multiple(m_number_of_bins);
             init_detection();
+            init_channel_filter();
         }
 
         int frame_sync_impl::general_work(int noutput_items,
@@ -495,6 +530,7 @@ namespace gr
             const gr_complex *in = (const gr_complex *)input_items[0];
             gr_complex *out = (gr_complex *)output_items[0];
             int items_to_output = 0;
+            int n_filt = 0;
 
             // check if there is enough space in the output buffer
             if ((uint32_t)noutput_items < m_number_of_bins)
@@ -531,6 +567,23 @@ namespace gr
 
                     // std::cout<<"\nhamming_cr "<<tags[0].offset<<" - cr: "<<(int)m_cr<<"\n";
                 }
+            }
+
+            if (m_os_factor > 1)
+            {
+                // Remove the noise located outside of the LoRa bandwidth before the downsampling, which would
+                // otherwise fold it into the signal. Only the samples that can be read below are filtered:
+                // one symbol, or two when additional upchirps of the preamble are saved. The filter is centered
+                // on each sample, which keeps the filtered signal aligned with the input and its tags.
+                int n_half = m_filt_taps.size() / 2;
+                int n_read = (m_state == SYNC && symbol_cnt == NET_ID1) ? (int)m_filt_out.size() : (int)(m_samples_per_symbol + 2 * m_os_factor);
+                int n_in = std::min(ninput_items[0], n_read + n_half);
+                n_filt = std::max(0, n_in - n_half);
+                memcpy(&m_filt_in[n_half], in, n_in * sizeof(gr_complex));
+                for (int i = 0; i < n_filt; i++)
+                    volk_32fc_32f_dot_prod_32fc(&m_filt_out[i], &m_filt_in[i], &m_filt_taps[0], m_filt_taps.size());
+                std::fill(m_filt_out.begin() + n_filt, m_filt_out.begin() + n_read, gr_complex(0, 0));
+                in = &m_filt_out[0];
             }
 
             // downsampling
@@ -993,6 +1046,13 @@ namespace gr
                 std::cerr << "[LoRa sync] WARNING : No state! Shouldn't happen\n";
                 break;
             }
+            }
+            if (m_os_factor > 1)
+            {
+                // keep the samples preceding the next input, they are needed to filter it
+                int n_half = m_filt_taps.size() / 2;
+                int n_keep = std::max(0, std::min(items_to_consume, n_filt));
+                memmove(&m_filt_in[0], &m_filt_in[n_keep], n_half * sizeof(gr_complex));
             }
             consume_each(items_to_consume);
             produce(0, items_to_output);

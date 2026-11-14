@@ -98,6 +98,10 @@ namespace gr
       std::vector<float> m_det_spec;       ///< dechirped spectra of the last m_n_up_req windows
       std::vector<float> m_det_acc;        ///< sum of the saved spectra
 
+      std::vector<float> m_filt_taps;          ///< taps of the channel filter applied before the downsampling
+      std::vector<gr_complex> m_filt_in;       ///< end of the previous input followed by the current one
+      std::vector<gr_complex> m_filt_out;      ///< filtered samples
+
       float m_cfo_frac;                            ///< fractional part of CFO
       float m_cfo_frac_bernier;                    ///< fractional part of CFO using Berniers algo
       int m_cfo_int;                               ///< integer part of CFO
@@ -191,6 +195,11 @@ namespace gr
           *  \brief  Reset the preamble detection and compute its threshold for the current SF
           */
       void init_detection();
+
+      /**
+          *  \brief  Design the channel filter for the current SF and oversampling factor
+          */
+      void init_channel_filter();
 
       float determine_snr(const gr_complex *samples);
 
