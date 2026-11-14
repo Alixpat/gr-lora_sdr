@@ -365,7 +365,7 @@ namespace gr
             m_det_sum.assign(m_number_of_bins, 0);
             // In noise only, each bin of the sum of n spectra follows a Gamma(n) law. Pick the threshold giving
             // the wanted false alarm probability per window, all bins considered.
-            double pfa = getenv("LORA_SYNC_PFA") ? atof(getenv("LORA_SYNC_PFA")) : 1e-3;
+            double pfa = getenv("LORA_SYNC_PFA") ? atof(getenv("LORA_SYNC_PFA")) : 1e-5;
             double target = pfa / m_number_of_bins;
             int n = m_n_up_req;
             double lo = 0, hi = 200;
@@ -621,13 +621,16 @@ namespace gr
                             for (uint32_t w = 0; w < n_win; w++)
                                 for (int d = -1; d <= 1; d++)
                                     e_win[w] = std::max(e_win[w], m_det_spec[w * m_number_of_bins + mod((int)k_max + d, m_number_of_bins)]);
-                            float e_min = *std::min_element(e_win.begin(), e_win.end());
                             float e_max = *std::max_element(e_win.begin(), e_win.end());
                             // With a strong signal a single window is enough to cross the threshold, while the
                             // others still hold the noise that preceded the frame. The frequency and timing
-                            // estimators run on all these windows, so wait until each of them carries a comparable
-                            // energy. This also rejects short bursts, which fill a single window.
-                            if (e_min > m_det_ratio_oldest * e_max)
+                            // estimators run on all these windows, so wait until the two oldest ones carry the
+                            // preamble. Among the following ones, a few weak windows are tolerated (a noisy
+                            // realisation of the preamble), but not more: this rejects short bursts.
+                            uint32_t n_weak = 0;
+                            for (uint32_t w = 2; w < n_win; w++)
+                                n_weak += e_win[w] <= m_det_ratio_oldest * e_max;
+                            if (e_win[0] > m_det_ratio_oldest * e_max && e_win[1] > m_det_ratio_oldest * e_max && n_weak <= (n_win - 2) / 3)
                             {
                                 detected = true;
                                 k_hat = k_max;
