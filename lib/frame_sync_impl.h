@@ -91,6 +91,15 @@ namespace gr
       int k_hat;                       ///< integer part of CFO+STO
       std::vector<int> preamb_up_vals; ///< value of the preamble upchirps
 
+      bool m_legacy_detect;            ///< use the original detector (consecutive identical hard decisions)
+      uint32_t m_det_cnt;              ///< number of windows held in the detector history
+      uint32_t m_det_armed;            ///< number of consecutive windows where the summed spectrum crossed the threshold
+      int m_det_last_k;                ///< bin of the peak at the previous window
+      std::vector<float> m_det_spec;   ///< dechirped spectra of the last m_n_up_req windows
+      std::vector<float> m_det_sum;    ///< sum of those spectra
+      float m_det_thresh;              ///< detection threshold on peak / mean of the summed spectrum
+      float m_det_ratio_oldest;        ///< minimum energy of the weakest window relative to the strongest one
+
       float m_cfo_frac;                            ///< fractional part of CFO
       float m_cfo_frac_bernier;                    ///< fractional part of CFO using Berniers algo
       int m_cfo_int;                               ///< integer part of CFO
@@ -142,6 +151,19 @@ namespace gr
           *          The reference chirp to use to dechirp the lora symbol.
           */
       uint32_t get_symbol_val(const gr_complex *samples, gr_complex *ref_chirp);
+
+      /**
+       *  \brief  Squared magnitude of the FFT of a dechirped symbol
+       */
+      void dechirped_spectrum(const gr_complex *samples, gr_complex *ref_chirp, float *mag_sq);
+      /**
+       *  \brief  (Re)initialise the preamble energy detector for the current SF
+       */
+      void init_detector();
+      /**
+       *  \brief  Save the quarter of symbol preceding the coarsely aligned window, without reading before the input buffer
+       */
+      void save_quarter_before_net_id(const gr_complex *in);
       
 
       /**

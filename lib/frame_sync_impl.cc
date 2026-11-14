@@ -7,6 +7,7 @@
 #include <gnuradio/io_signature.h>
 #include <volk/volk_alloc.hh>
 #include "frame_sync_impl.h"
+#include <numeric>
 
 namespace gr
 {
@@ -84,6 +85,7 @@ namespace gr
             m_kiss_fft_cfg = kiss_fft_alloc(m_number_of_bins, 0, 0, 0);
             cx_in = new kiss_fft_cpx[m_number_of_bins];
             cx_out = new kiss_fft_cpx[m_number_of_bins];
+            init_detector();
             // register message ports
             message_port_register_in(pmt::mp("frame_info"));
             set_msg_handler(pmt::mp("frame_info"), [this](pmt::pmt_t msg)
@@ -319,6 +321,71 @@ namespace gr
             return sto_frac;
         }
 
+        void frame_sync_impl::dechirped_spectrum(const gr_complex *samples, gr_complex *ref_chirp, float *mag_sq)
+        {
+            volk::vector<gr_complex> dechirped(m_number_of_bins);
+            volk_32fc_x2_multiply_32fc(&dechirped[0], samples, ref_chirp, m_number_of_bins);
+            for (uint32_t i = 0; i < m_number_of_bins; i++)
+            {
+                cx_in[i].r = dechirped[i].real();
+                cx_in[i].i = dechirped[i].imag();
+            }
+            kiss_fft(m_kiss_fft_cfg, cx_in, cx_out);
+            for (uint32_t i = 0u; i < m_number_of_bins; i++)
+                mag_sq[i] = cx_out[i].r * cx_out[i].r + cx_out[i].i * cx_out[i].i;
+        }
+
+        void frame_sync_impl::save_quarter_before_net_id(const gr_complex *in)
+        {
+            // Keep the quarter of symbol that precedes the window obtained after the coarse alignment.
+            // When k_hat exceeds 3/4 of a symbol, it starts before the current input buffer: those samples
+            // have already been consumed and must not be read from `in` (out of bounds access). They are
+            // taken from the copy of the previous window instead (stored from in[m_os_factor / 2]).
+            int quarter = m_samples_per_symbol / 4;
+            int start = int(0.75 * m_samples_per_symbol - k_hat * m_os_factor);
+            int from_prev = std::min(quarter, std::max(0, -start));
+            if (from_prev > 0)
+            {
+                const gr_complex *prev = &preamble_raw_up[(m_n_up_req - 2) * m_samples_per_symbol];
+                int src = (int)m_samples_per_symbol + start - (int)(m_os_factor / 2);
+                for (int i = 0; i < from_prev; i++)
+                    net_id_samp[i] = (src + i >= 0) ? prev[src + i] : gr_complex(0, 0);
+            }
+            if (from_prev < quarter)
+                memcpy(&net_id_samp[from_prev], &in[start + from_prev], sizeof(gr_complex) * (quarter - from_prev));
+        }
+
+        void frame_sync_impl::init_detector()
+        {
+            m_legacy_detect = getenv("LORA_SYNC_LEGACY") != NULL;
+            m_det_cnt = 0;
+            m_det_armed = 0;
+            m_det_last_k = 0;
+            m_det_spec.assign(m_n_up_req * m_number_of_bins, 0);
+            m_det_sum.assign(m_number_of_bins, 0);
+            // In noise only, each bin of the sum of n spectra follows a Gamma(n) law. Pick the threshold giving
+            // the wanted false alarm probability per window, all bins considered.
+            double pfa = getenv("LORA_SYNC_PFA") ? atof(getenv("LORA_SYNC_PFA")) : 1e-3;
+            double target = pfa / m_number_of_bins;
+            int n = m_n_up_req;
+            double lo = 0, hi = 200;
+            for (int it = 0; it < 100; it++)
+            {
+                double x = (lo + hi) / 2, term = 1, sum = 1;
+                for (int j = 1; j < n; j++)
+                {
+                    term *= x / j;
+                    sum += term;
+                }
+                if (exp(-x) * sum > target)
+                    lo = x;
+                else
+                    hi = x;
+            }
+            m_det_thresh = hi / n;
+            m_det_ratio_oldest = getenv("LORA_SYNC_RATIO") ? atof(getenv("LORA_SYNC_RATIO")) : 0.25;
+        }
+
         uint32_t frame_sync_impl::get_symbol_val(const gr_complex *samples, gr_complex *ref_chirp)
         {
             double sig_en = 0;
@@ -448,6 +515,7 @@ namespace gr
             cx_in = new kiss_fft_cpx[m_number_of_bins];
             cx_out = new kiss_fft_cpx[m_number_of_bins];
             set_output_multiple(m_number_of_bins);
+            init_detector();
         }
 
         int frame_sync_impl::general_work(int noutput_items,
@@ -504,6 +572,99 @@ namespace gr
             {
             case DETECT:
             {
+                if (!m_legacy_detect)
+                {
+                    // Energy detection: instead of requiring m_n_up_req consecutive symbols whose individual
+                    // hard decisions agree, accumulate the dechirped spectra of the last m_n_up_req windows
+                    // and look for a bin that stands out of the noise in the sum. A single noisy symbol no
+                    // longer breaks the detection.
+                    const uint32_t n_win = m_n_up_req;
+                    if (m_det_cnt == n_win)
+                    { // history full: drop the oldest window
+                        memmove(&m_det_spec[0], &m_det_spec[m_number_of_bins], (n_win - 1) * m_number_of_bins * sizeof(float));
+                        memmove(&preamble_raw[0], &preamble_raw[m_number_of_bins], (n_win - 1) * m_number_of_bins * sizeof(gr_complex));
+                        memmove(&preamble_raw_up[0], &preamble_raw_up[m_samples_per_symbol], (n_win - 1) * m_samples_per_symbol * sizeof(gr_complex));
+                        m_det_cnt--;
+                    }
+                    dechirped_spectrum(&in_down[0], &m_downchirp[0], &m_det_spec[m_det_cnt * m_number_of_bins]);
+                    memcpy(&preamble_raw[m_number_of_bins * m_det_cnt], &in_down[0], m_number_of_bins * sizeof(gr_complex));
+                    memcpy(&preamble_raw_up[m_samples_per_symbol * m_det_cnt], &in[(int)(m_os_factor / 2)], m_samples_per_symbol * sizeof(gr_complex));
+                    m_det_cnt++;
+
+                    bool detected = false;
+                    if (m_det_cnt == n_win)
+                    {
+                        double total = 0;
+                        uint32_t k_max = 0;
+                        for (uint32_t k = 0; k < m_number_of_bins; k++)
+                        {
+                            float acc = 0;
+                            for (uint32_t w = 0; w < n_win; w++)
+                                acc += m_det_spec[w * m_number_of_bins + k];
+                            m_det_sum[k] = acc;
+                            total += acc;
+                            if (acc > m_det_sum[k_max])
+                                k_max = k;
+                        }
+                        double mean = total / m_number_of_bins; // noise level of the sum (slightly overestimated)
+                        if (mean > 0 && m_det_sum[k_max] > m_det_thresh * mean &&
+                            (m_det_armed == 0 || abs(mod((int)k_max - m_det_last_k + (int)m_number_of_bins / 2, m_number_of_bins) - (int)m_number_of_bins / 2) <= 1))
+                        {
+                            m_det_armed++;
+                            m_det_last_k = k_max;
+                            // The sum can cross the threshold while the oldest windows still hold the noise that
+                            // preceded the frame, which would spoil the estimators run on the stored preamble.
+                            // Trigger only once the oldest window shows the preamble on its own, or when the
+                            // threshold has been crossed for long enough that the history is full of preamble.
+                            // energy of each window around the peak
+                            std::vector<float> e_win(n_win, 0);
+                            for (uint32_t w = 0; w < n_win; w++)
+                                for (int d = -1; d <= 1; d++)
+                                    e_win[w] = std::max(e_win[w], m_det_spec[w * m_number_of_bins + mod((int)k_max + d, m_number_of_bins)]);
+                            float e_min = *std::min_element(e_win.begin(), e_win.end());
+                            float e_max = *std::max_element(e_win.begin(), e_win.end());
+                            // With a strong signal a single window is enough to cross the threshold, while the
+                            // others still hold the noise that preceded the frame. The frequency and timing
+                            // estimators run on all these windows, so wait until each of them carries a comparable
+                            // energy. This also rejects short bursts, which fill a single window.
+                            if (e_min > m_det_ratio_oldest * e_max)
+                            {
+                                detected = true;
+                                k_hat = k_max;
+                            }
+                        }
+                        else
+                            m_det_armed = 0;
+                    }
+                    if (detected)
+                    {
+                        if (getenv("LORA_SYNC_DEBUG"))
+                        {
+                            fprintf(stderr, "SYNCDBG DETECT pos=%llu k=%d armed=%u e=", (unsigned long long)nitems_read(0), k_hat, m_det_armed);
+                            for (uint32_t w = 0; w < n_win; w++)
+                            {
+                                float e = 0;
+                                for (int d = -1; d <= 1; d++)
+                                    e = std::max(e, m_det_spec[w * m_number_of_bins + mod(k_hat + d, m_number_of_bins)]);
+                                fprintf(stderr, "%.0f ", e * m_number_of_bins * n_win / std::accumulate(m_det_sum.begin(), m_det_sum.end(), 0.0));
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                        m_det_cnt = 0;
+                        m_det_armed = 0;
+                        additional_upchirps = 0;
+                        m_state = SYNC;
+                        symbol_cnt = 0;
+                        cfo_frac_sto_frac_est = false;
+                        save_quarter_before_net_id(in);
+                        // perform the coarse synchronization
+                        items_to_consume = m_os_factor * ((int)(m_number_of_bins - k_hat));
+                    }
+                    else
+                        items_to_consume = m_samples_per_symbol;
+                    items_to_output = 0;
+                    break;
+                }
                 bin_idx_new = get_symbol_val(&in_down[0], &m_downchirp[0]);
 
                 if (abs(mod(abs(bin_idx_new - bin_idx) + 1, m_number_of_bins) - 1) <= 1 && bin_idx_new != -1) // look for consecutive reference upchirps(with a margin of ±1)
@@ -527,12 +688,13 @@ namespace gr
                 bin_idx = bin_idx_new;
                 if (symbol_cnt == (int)(m_n_up_req))
                 {
+                    if (getenv("LORA_SYNC_DEBUG")) fprintf(stderr, "SYNCDBG DETECT pos=%llu k=%d (legacy)\n", (unsigned long long)nitems_read(0), most_frequent(&preamb_up_vals[0], preamb_up_vals.size()));
                     additional_upchirps = 0;
                     m_state = SYNC;
                     symbol_cnt = 0;
                     cfo_frac_sto_frac_est = false;
                     k_hat = most_frequent(&preamb_up_vals[0], preamb_up_vals.size());
-                    memcpy(&net_id_samp[0], &in[int(0.75 * m_samples_per_symbol - k_hat * m_os_factor)], sizeof(gr_complex) * 0.25 * m_samples_per_symbol);
+                    save_quarter_before_net_id(in);
 
                     // perform the coarse synchronization
                     items_to_consume = m_os_factor * ((int)(m_number_of_bins - k_hat));
@@ -565,7 +727,22 @@ namespace gr
                 {
                 case NET_ID1:
                 {
-                    if (bin_idx == 0 || bin_idx == 1 || (uint32_t)bin_idx == m_number_of_bins - 1)
+                    bool is_upchirp = bin_idx == 0 || bin_idx == 1 || (uint32_t)bin_idx == m_number_of_bins - 1;
+                    if (!m_legacy_detect && m_sync_words[0] != 0)
+                    {
+                        // The expected network identifier is known: rather than trusting the hard decision of a
+                        // single symbol (any value off by two ended the preamble and lost the frame), compare
+                        // the energy around the upchirp bin with the energy around the expected identifier.
+                        dechirped_spectrum(&symb_corr[0], &m_downchirp[0], &m_det_sum[0]);
+                        float e_up = 0, e_id = 0;
+                        for (int d = -2; d <= 2; d++)
+                        {
+                            e_up = std::max(e_up, m_det_sum[mod(d, m_number_of_bins)]);
+                            e_id = std::max(e_id, m_det_sum[mod((int)m_sync_words[0] + d, m_number_of_bins)]);
+                        }
+                        is_upchirp = e_up >= e_id;
+                    }
+                    if (is_upchirp)
                     { // look for additional upchirps. Won't work if network identifier 1 equals 2^sf-1, 0 or 1!
                         memcpy(&net_id_samp[0], &in[(int)0.75 * m_samples_per_symbol], sizeof(gr_complex) * 0.25 * m_samples_per_symbol);
                         if (additional_upchirps >= 3)
@@ -619,6 +796,18 @@ namespace gr
                     else
                     {
                         m_cfo_int = floor(double(down_val - (int)m_number_of_bins) / 2);
+                    }
+
+                    if ((uint32_t)abs(m_cfo_int) > m_number_of_bins / 4)
+                    { // not a frame (false detection): the offsets below would index outside of the buffers
+                        if (getenv("LORA_SYNC_DEBUG")) fprintf(stderr, "SYNCDBG %s\n", "REJET_CFO");
+                        m_state = DETECT;
+                        symbol_cnt = 1;
+                        items_to_output = 0;
+                        k_hat = 0;
+                        m_sto_frac = 0;
+                        items_to_consume = 0;
+                        break;
                     }
 
                     // correct STOint and CFOint in the preamble upchirps
@@ -707,6 +896,7 @@ namespace gr
                     int netid1 = get_symbol_val(&net_ids_samp_dec[0], &m_downchirp[0]);
                     int netid2 = get_symbol_val(&net_ids_samp_dec[m_number_of_bins], &m_downchirp[0]);
                     one_symbol_off = 0;
+                    if (getenv("LORA_SYNC_DEBUG")) fprintf(stderr, "SYNCDBG VALEURS netid1=%d netid2=%d down=%d add_up=%d\n", netid1, netid2, down_val, additional_upchirps);
 
                     if (m_sync_words[0] == 0) { // match netid1 only if requested
                         items_to_consume = 0;
@@ -748,6 +938,7 @@ namespace gr
                             }
                             if (!one_symbol_off)
                             {
+                                if (getenv("LORA_SYNC_DEBUG")) fprintf(stderr, "SYNCDBG %s\n", "REJET_NETID1_DECALE");
                                 m_state = DETECT;
                                 symbol_cnt = 1;
                                 items_to_output = 0;
@@ -758,6 +949,7 @@ namespace gr
                         }
                         else
                         {
+                            if (getenv("LORA_SYNC_DEBUG")) fprintf(stderr, "SYNCDBG %s\n", "REJET_NETID1");
                             m_state = DETECT;
                             symbol_cnt = 1;
                             items_to_output = 0;
@@ -769,9 +961,13 @@ namespace gr
                     else // net ID 1 valid
                     {
                         net_id_off = netid1 - (int32_t)m_sync_words[0];
+                        // distance between the second identifier and its expected value. A transmitter whose
+                        // frequency is still settling shifts it by one bin relative to the first identifier.
+                        int net_id2_err = mod(netid2 - net_id_off - (int32_t)m_sync_words[1] + (int)m_number_of_bins / 2, m_number_of_bins) - (int)m_number_of_bins / 2;
                         if (m_sync_words[1] != 0 && // match netid2 only if requested
-                            mod(netid2 - net_id_off, m_number_of_bins) != (int32_t)m_sync_words[1]) // wrong id 2
+                            abs(net_id2_err) > (m_legacy_detect ? 0 : 1)) // wrong id 2
                         {
+                            if (getenv("LORA_SYNC_DEBUG")) fprintf(stderr, "SYNCDBG %s\n", "REJET_NETID2");
                             m_state = DETECT;
                             symbol_cnt = 1;
                             items_to_output = 0;
@@ -794,6 +990,7 @@ namespace gr
                     }
                     if (m_state != DETECT)
                     {
+                        if (getenv("LORA_SYNC_DEBUG")) fprintf(stderr, "SYNCDBG ACCEPTE netid1=%d netid2=%d cfo_int=%d add_up=%d k_hat=%d cfo_frac=%.3f sto_frac=%.3f pos=%llu\n", netid1, netid2, m_cfo_int, additional_upchirps, k_hat, m_cfo_frac, m_sto_frac, (unsigned long long)nitems_read(0));
                         // update sto_frac to its value at the payload beginning
                         m_sto_frac += sfo_hat * 4.25;
                         sfo_cum = ((m_sto_frac * m_os_factor) - my_roundf(m_sto_frac * m_os_factor)) / m_os_factor;
