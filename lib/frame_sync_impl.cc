@@ -365,7 +365,7 @@ namespace gr
             m_det_sum.assign(m_number_of_bins, 0);
             // In noise only, each bin of the sum of n spectra follows a Gamma(n) law. Pick the threshold giving
             // the wanted false alarm probability per window, all bins considered.
-            double pfa = getenv("LORA_SYNC_PFA") ? atof(getenv("LORA_SYNC_PFA")) : 1e-5;
+            double pfa = getenv("LORA_SYNC_PFA") ? atof(getenv("LORA_SYNC_PFA")) : 1e-6;
             double target = pfa / m_number_of_bins;
             int n = m_n_up_req;
             double lo = 0, hi = 200;
