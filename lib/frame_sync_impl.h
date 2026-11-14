@@ -99,6 +99,7 @@ namespace gr
       std::vector<float> m_det_acc;        ///< sum of the saved spectra
 
       std::vector<float> m_filt_taps;          ///< taps of the channel filter applied before the downsampling
+      std::vector<gr_complex> m_filt_taps_cfo; ///< taps of the channel filter centered on the frequency of the current frame
       std::vector<gr_complex> m_filt_in;       ///< end of the previous input followed by the current one
       std::vector<gr_complex> m_filt_out;      ///< filtered samples
 

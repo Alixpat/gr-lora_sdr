@@ -368,6 +368,7 @@ namespace gr
                 }
                 for (int n = 0; n < n_taps; n++)
                     m_filt_taps[n] /= tap_sum;
+                m_filt_taps_cfo.assign(m_filt_taps.begin(), m_filt_taps.end());
                 m_filt_in.assign(n_taps + 2 * m_samples_per_symbol + 2 * m_os_factor, gr_complex(0, 0));
                 m_filt_out.assign(2 * m_samples_per_symbol + 2 * m_os_factor, gr_complex(0, 0));
             }
@@ -580,8 +581,16 @@ namespace gr
                 int n_in = std::min(ninput_items[0], n_read + n_half);
                 n_filt = std::max(0, n_in - n_half);
                 memcpy(&m_filt_in[n_half], in, n_in * sizeof(gr_complex));
-                for (int i = 0; i < n_filt; i++)
-                    volk_32fc_32f_dot_prod_32fc(&m_filt_out[i], &m_filt_in[i], &m_filt_taps[0], m_filt_taps.size());
+                if (m_state == SFO_COMPENSATION)
+                { // the frequency of the transmitter is known: use the filter centered on it
+                    for (int i = 0; i < n_filt; i++)
+                        volk_32fc_x2_dot_prod_32fc(&m_filt_out[i], &m_filt_in[i], &m_filt_taps_cfo[0], m_filt_taps_cfo.size());
+                }
+                else
+                {
+                    for (int i = 0; i < n_filt; i++)
+                        volk_32fc_32f_dot_prod_32fc(&m_filt_out[i], &m_filt_in[i], &m_filt_taps[0], m_filt_taps.size());
+                }
                 std::fill(m_filt_out.begin() + n_filt, m_filt_out.begin() + n_read, gr_complex(0, 0));
                 in = &m_filt_out[0];
             }
@@ -966,6 +975,13 @@ namespace gr
                         frame_info = pmt::dict_add(frame_info, pmt::intern("sf"), pmt::mp((long)m_sf));
 
                         add_item_tag(0, nitems_written(0), pmt::string_to_symbol("frame_info"), frame_info);
+
+                        // center the channel filter on the estimated frequency of the transmitter for the rest of
+                        // the frame: with a frequency offset, part of the signal is otherwise attenuated
+                        double cfo_norm = (m_cfo_int + m_cfo_frac) / (double)m_samples_per_symbol; // in cycles per input sample
+                        int n_half = m_filt_taps.size() / 2;
+                        for (size_t k = 0; k < m_filt_taps.size(); k++)
+                            m_filt_taps_cfo[k] = m_filt_taps[k] * gr_expj(-2 * M_PI * cfo_norm * ((int)k - n_half));
 
                         m_received_head = false;
                         items_to_consume += m_samples_per_symbol / 4 + m_os_factor * m_cfo_int;
